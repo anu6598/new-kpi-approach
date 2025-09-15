@@ -1,300 +1,282 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
 
-st.set_page_config(page_title="High-Risk User Review", layout="wide")
-
-# -------------------------
-# Helpers
-# -------------------------
-
-def parse_date_str(d):
-    """Try to parse date-like strings (YYYY/MM/DD or YYYY-MM-DD) to date."""
-    if pd.isna(d):
-        return pd.NaT
-    try:
-        return pd.to_datetime(d, errors='coerce').dt.date if isinstance(d, pd.Series) else pd.to_datetime(d).date()
-    except Exception:
-        try:
-            return pd.to_datetime(d, format='%Y/%m/%d', errors='coerce').date()
-        except Exception:
-            return pd.NaT
-
-
-def millis_to_datetime(col):
-    # col may be numeric or string
-    return pd.to_datetime(col.astype('float64') / 1000, unit='s', errors='coerce')
-
-
-def safe_lower(x):
-    return str(x).strip().lower() if pd.notna(x) else ''
-
-
-# -------------------------
-# Upload area
-# -------------------------
-st.title("🔎 High-Risk User Review Dashboard (one-pager)")
-st.markdown("Upload the three CSVs (license, lesson_test_submissions, video_meta) and optionally suspicious_activity_logs. Files must be per-day exports or full history.")
-
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    f_license = st.file_uploader("Upload video_license_logs CSV", type=["csv"], key='license')
-with col2:
-    f_lesson = st.file_uploader("Upload lesson_test_submissions CSV", type=["csv"], key='lesson')
-with col3:
-    f_meta = st.file_uploader("Upload video_meta CSV (optional)", type=["csv"], key='meta')
-with col4:
-    f_susp = st.file_uploader("Upload suspicious_activity_logs CSV (optional)", type=["csv"], key='susp')
-
-if not f_license:
-    st.info("Please upload video_license_logs CSV to proceed.")
-    st.stop()
-
-# read license
-license_df = pd.read_csv(f_license)
-# normalize column names
-license_df.columns = [c.strip().lower().replace('-', '_').replace(' ', '_') for c in license_df.columns]
-
-# ensure date column exists and is parsed
-if 'date' in license_df.columns:
-    # some date strings are like 2025/09/11
-    try:
-        license_df['date_parsed'] = pd.to_datetime(license_df['date'], errors='coerce').dt.date
-    except Exception:
-        license_df['date_parsed'] = license_df['date'].apply(lambda x: pd.to_datetime(x, errors='coerce')).dt.date
-else:
-    # try created_on
-    if 'created_on' in license_df.columns:
-        license_df['date_parsed'] = pd.to_datetime(license_df['created_on'], errors='coerce').dt.date
-    else:
-        license_df['date_parsed'] = pd.NaT
-
-# basic normalization for expected columns
-for col in ['user_id','device_id','lesson_id','lesson_id','edition','ip','x_real_ip']:
-    if col not in license_df.columns:
-        license_df[col] = np.nan
-
-# read lesson tests
-if f_lesson:
-    ldf = pd.read_csv(f_lesson)
-    ldf.columns = [c.strip().lower().replace('-', '_').replace(' ', '_') for c in ldf.columns]
-    # submitted_on is milliseconds string
-    if 'submitted_on' in ldf.columns:
-        ldf['submitted_on_dt'] = millis_to_datetime(ldf['submitted_on'])
-        ldf['submit_date'] = ldf['submitted_on_dt'].dt.date
-    else:
-        ldf['submitted_on_dt'] = pd.NaT
-        ldf['submit_date'] = pd.NaT
-else:
-    ldf = pd.DataFrame()
-
-# read video meta
-if f_meta:
-    meta = pd.read_csv(f_meta)
-    meta.columns = [c.strip().lower().replace('-', '_').replace(' ', '_') for c in meta.columns]
-else:
-    meta = pd.DataFrame()
-
-# suspicious logs
-if f_susp:
-    susp = pd.read_csv(f_susp)
-    susp.columns = [c.strip().lower().replace('-', '_').replace(' ', '_') for c in susp.columns]
-else:
-    susp = pd.DataFrame()
-
-# -------------------------
-# UI filters
-# -------------------------
-min_date = license_df['date_parsed'].min()
-max_date = license_df['date_parsed'].max()
-
-st.sidebar.header("Filters")
-date_range = st.sidebar.date_input("Date range (license table)", value=(min_date, max_date) if pd.notna(min_date) else None)
-user_filter = st.sidebar.text_input("User ID (optional)")
-selected_user = None
-
-# build user list from license and lesson tables
-user_list = pd.unique(np.concatenate([
-    license_df['user_id'].dropna().astype(str).unique(),
-    ldf['user_id'].dropna().astype(str).unique() if not ldf.empty else np.array([])
-]))
-user_list = [u for u in user_list if u and u!='nan']
-user_list_sorted = sorted(user_list)
-user_select = st.sidebar.selectbox("Quick select user (optional)", options=[''] + user_list_sorted)
-
-if user_select:
-    user_filter = user_select
-
-# apply date filter to license
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    start_d, end_d = date_range
-    license_filtered = license_df[(license_df['date_parsed'] >= start_d) & (license_df['date_parsed'] <= end_d)]
-else:
-    license_filtered = license_df.copy()
-
-# apply user filter
-if user_filter:
-    license_filtered = license_filtered[license_filtered['user_id'].astype(str) == str(user_filter)]
-
-# -------------------------
-# License-level aggregations per device per day
-# -------------------------
-st.header("License: device/day level summary")
-
-# compute videos hit license per device (count distinct lesson_id)
-license_agg = (
-    license_filtered.groupby(['date_parsed','user_id','device_id'], dropna=False)
-    .agg(
-        videos_hit_license=('lesson_id', lambda s: s.dropna().astype(str).nunique()),
-        total_rows=('lesson_id', 'count')
-    )
-    .reset_index()
+# Page configuration
+st.set_page_config(
+    page_title="User Analytics Dashboard",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# subjects per device using meta if available
-if not meta.empty and 'lesson_id' in meta.columns:
-    meta_small = meta[['lesson_id','_subject_title']].drop_duplicates()
-    # join to license_filtered
-    lf = license_filtered.merge(meta_small, left_on='lesson_id', right_on='lesson_id', how='left')
-    subj = (lf.groupby(['date_parsed','user_id','device_id'])['_subject_title']
-            .apply(lambda s: ', '.join(sorted(set([x for x in s.dropna().astype(str)]))))
-            .reset_index(name='subjects_per_device'))
-    license_agg = license_agg.merge(subj, on=['date_parsed','user_id','device_id'], how='left')
-else:
-    license_agg['subjects_per_device'] = ''
+# Title
+st.title("📊 User Analytics Dashboard")
+st.markdown("---")
 
-# repeat count license: per user count distinct dates where license count > 10
-user_repeat = (
-    license_filtered.groupby(['date_parsed','user_id'])['lesson_id']
-    .apply(lambda s: s.dropna().astype(str).nunique())
-    .reset_index(name='distinct_lessons_per_date')
-)
-user_repeat_flag = (user_repeat[user_repeat['distinct_lessons_per_date'] > 10]
-                    .groupby('user_id')['date_parsed'].nunique()
-                    .reset_index(name='repeat_count_dates_gt_10'))
+# File upload section
+st.sidebar.header("Upload Data Files")
+video_license_file = st.sidebar.file_uploader("Video License Logs CSV", type=['csv'])
+lesson_test_file = st.sidebar.file_uploader("Lesson Test Submissions CSV", type=['csv'])
+video_meta_file = st.sidebar.file_uploader("Video Meta CSV", type=['csv'])
+suspicious_activity_file = st.sidebar.file_uploader("Suspicious Activity Logs CSV", type=['csv'])
 
-# merge repeat to license_agg per user
-license_agg = license_agg.merge(user_repeat_flag, on='user_id', how='left')
-license_agg['repeat_count_dates_gt_10'] = license_agg['repeat_count_dates_gt_10'].fillna(0).astype(int)
+# Load data function
+@st.cache_data
+def load_data(file):
+    if file is not None:
+        return pd.read_csv(file)
+    return None
 
-st.dataframe(license_agg.sort_values(['date_parsed','user_id','videos_hit_license'], ascending=[False,True,False]).head(200), use_container_width=True)
+# Load all datasets
+video_license_df = load_data(video_license_file)
+lesson_test_df = load_data(lesson_test_file)
+video_meta_df = load_data(video_meta_file)
+suspicious_activity_df = load_data(suspicious_activity_file)
 
-# allow selecting user by clicking selectbox
-clicked_user = st.selectbox('Select User to filter all views (or use sidebar)', options=[''] + user_list_sorted)
-if clicked_user:
-    selected_user = clicked_user
-
-# -------------------------
-# Lesson test aggregation logic (SQL -> Python)
-# -------------------------
-st.header('Lesson / Test / CM submissions (per user-device-day)')
-if ldf.empty:
-    st.info('No lesson_test_submissions file uploaded')
-else:
-    # normalize content_sub_type: may be dict-like or string
-    def sub_type_is_one(x):
-        try:
-            # if dict-like string, try to detect 'numberint'
-            if isinstance(x, str) and 'numberint' in x:
-                return '1' in x
-            return str(x).strip() in ['1', "{numberint=1}"]
-        except Exception:
-            return False
-
-    ldf['is_qbank'] = ((ldf['content_type'] == 'lesson') & ldf['content_sub_type'].apply(lambda x: sub_type_is_one(x)))
-    ldf['is_test'] = ((ldf['content_type'] == 'test') & ldf['content_sub_type'].isna())
-
-    # group by date,user,device
-    qb_agg = (
-        ldf.groupby(['submit_date','user_id','device_id'], dropna=False)
-        .agg(
-            qbank_submits=('content_id', lambda s: s[ldf.loc[s.index,'is_qbank']].dropna().nunique() if len(s)>0 else 0),
-            test_submits=('content_id', lambda s: s[ldf.loc[s.index,'is_test']].dropna().nunique() if len(s)>0 else 0)
-        )
-        .reset_index()
-    )
-
-    # custom modules by joined c table: we simulated by counting custom_module_id if present
-    if 'custom_module_id' in ldf.columns:
-        cm_agg = ldf.groupby(['submit_date','user_id','device_id'])['custom_module_id'].nunique().reset_index(name='cm_submits')
-        qb_agg = qb_agg.merge(cm_agg, on=['submit_date','user_id','device_id'], how='left')
-    else:
-        qb_agg['cm_submits'] = 0
-
-    st.dataframe(qb_agg.sort_values(['submit_date','user_id'], ascending=[False,True]).head(200), use_container_width=True)
-
-# -------------------------
-# Suspicious activity logs table (display)
-# -------------------------
-st.header('Suspicious activity logs (raw)')
-if susp.empty:
-    st.info('No suspicious_activity_logs uploaded')
-else:
-    susp['created_on_dt'] = pd.to_datetime(susp['created_on'], errors='coerce')
-    st.dataframe(susp[['created_on_dt','user_id','x_real_ip','message']].head(300), use_container_width=True)
-
-# -------------------------
-# Cross-filtering when user selected
-# -------------------------
-if selected_user:
-    st.markdown(f"### Filtered views for user: **{selected_user}**")
-    lf = license_agg[license_agg['user_id'].astype(str) == selected_user]
-    st.dataframe(lf, use_container_width=True)
-    if not ldf.empty:
-        qf = qb_agg[qb_agg['user_id'].astype(str) == selected_user]
-        st.dataframe(qf, use_container_width=True)
-    if not susp.empty:
-        st.dataframe(susp[susp['user_id'].astype(str) == selected_user], use_container_width=True)
-
-# -------------------------
-# Visuals: timeline, device split, radar risk
-# -------------------------
-st.header('Visuals')
-# timeline of videos_hit per day (aggregated across devices)
-agg_user_daily = license_agg.groupby(['date_parsed']).agg(total_videos=('videos_hit_license','sum')).reset_index()
-if not agg_user_daily.empty:
-    fig = px.bar(agg_user_daily, x='date_parsed', y='total_videos', title='Total videos hit (all users) per day')
-    st.plotly_chart(fig, use_container_width=True)
-
-# device distribution pie for filtered license
-if not license_agg.empty:
-    dev_counts = license_agg.groupby('device_id')['videos_hit_license'].sum().reset_index()
-    dev_counts = dev_counts[dev_counts['device_id'].notna()]
-    if not dev_counts.empty:
-        fig2 = px.pie(dev_counts, names='device_id', values='videos_hit_license', title='Device share (videos)')
+# Check if all files are uploaded
+if all(df is not None for df in [video_license_df, lesson_test_df, video_meta_df, suspicious_activity_df]):
+    
+    # Convert date columns to datetime
+    video_license_df['date'] = pd.to_datetime(video_license_df['date'])
+    lesson_test_df['submitted_on'] = pd.to_datetime(lesson_test_df['submitted_on'], unit='ms')
+    suspicious_activity_df['date'] = pd.to_datetime(suspicious_activity_df['date'])
+    
+    # Create tabs for different sections
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📹 Video License Analysis", 
+        "📝 Test Submissions Analysis", 
+        "🎥 Video Meta Analysis", 
+        "🚨 Suspicious Activity"
+    ])
+    
+    with tab1:
+        st.header("Video License Analysis")
+        
+        # License date, User id, Device ID analysis
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.subheader("License Date Range")
+            min_date = video_license_df['date'].min()
+            max_date = video_license_df['date'].max()
+            st.write(f"**From:** {min_date.strftime('%Y-%m-%d')}")
+            st.write(f"**To:** {max_date.strftime('%Y-%m-%d')}")
+        
+        with col2:
+            st.subheader("Unique Users & Devices")
+            unique_users = video_license_df['user_id'].nunique()
+            unique_devices = video_license_df['device_id'].nunique()
+            st.write(f"**Unique Users:** {unique_users}")
+            st.write(f"**Unique Devices:** {unique_devices}")
+        
+        with col3:
+            st.subheader("Total License Hits")
+            total_licenses = len(video_license_df)
+            st.write(f"**Total License Requests:** {total_licenses}")
+        
+        # No of videos hit license per device
+        st.subheader("Videos per Device Analysis")
+        videos_per_device = video_license_df.groupby(['device_id', 'user_id']).agg({
+            'video_id': 'nunique',
+            'date': 'nunique'
+        }).reset_index()
+        videos_per_device.columns = ['device_id', 'user_id', 'unique_videos', 'unique_days']
+        
+        fig1 = px.histogram(videos_per_device, x='unique_videos', 
+                           title='Distribution of Unique Videos per Device')
+        st.plotly_chart(fig1, use_container_width=True)
+        
+        # Repeat Count license (count distinct of date where license count > 10 for that user)
+        st.subheader("High-Frequency Users (License Count > 10 per day)")
+        daily_license_count = video_license_df.groupby(['user_id', 'date']).size().reset_index(name='license_count')
+        high_freq_users = daily_license_count[daily_license_count['license_count'] > 10]
+        
+        if not high_freq_users.empty:
+            repeat_counts = high_freq_users.groupby('user_id')['date'].nunique().reset_index()
+            repeat_counts.columns = ['user_id', 'high_frequency_days']
+            
+            fig2 = px.bar(repeat_counts, x='user_id', y='high_frequency_days',
+                         title='Users with High License Frequency (>10/day)')
+            st.plotly_chart(fig2, use_container_width=True)
+            
+            st.dataframe(repeat_counts.sort_values('high_frequency_days', ascending=False))
+        else:
+            st.info("No users with license count > 10 per day found.")
+        
+        # Subjects accessed - per device
+        st.subheader("Subjects Accessed per Device")
+        if 'course_id' in video_license_df.columns and 'device_id' in video_license_df.columns:
+            subjects_per_device = video_license_df.groupby(['device_id', 'user_id'])['course_id'].nunique().reset_index()
+            subjects_per_device.columns = ['device_id', 'user_id', 'unique_subjects']
+            
+            fig3 = px.box(subjects_per_device, y='unique_subjects', 
+                         title='Distribution of Unique Subjects per Device')
+            st.plotly_chart(fig3, use_container_width=True)
+        
+        # Display raw data
+        st.subheader("Raw Video License Data")
+        st.dataframe(video_license_df.head(100))
+    
+    with tab2:
+        st.header("Lesson Test Submissions Analysis")
+        
+        # Convert the SQL logic to Python
+        def analyze_test_submissions(lesson_df):
+            # Create a copy to avoid modifying original data
+            df = lesson_df.copy()
+            
+            # Ensure submitted_on is datetime
+            df['submit_date'] = pd.to_datetime(df['submitted_on']).dt.date
+            
+            # Qbank submits (content_type = 'lesson' AND content_sub_type = '1')
+            qbank_mask = (df['content_type'] == 'lesson') & (df['content_sub_type'] == '1')
+            qbank_submits = df[qbank_mask].groupby(['user_id', 'device_id', 'submit_date'])['content_id'].nunique().reset_index()
+            qbank_submits.columns = ['user_id', 'device_id', 'submit_date', 'qbank_submits']
+            
+            # Test submits (content_type = 'test' AND content_sub_type IS NULL)
+            test_mask = (df['content_type'] == 'test') & (df['content_sub_type'].isna())
+            test_submits = df[test_mask].groupby(['user_id', 'device_id', 'submit_date'])['content_id'].nunique().reset_index()
+            test_submits.columns = ['user_id', 'device_id', 'submit_date', 'test_submits']
+            
+            # Merge results
+            result = pd.merge(qbank_submits, test_submits, 
+                            on=['user_id', 'device_id', 'submit_date'], 
+                            how='outer').fillna(0)
+            
+            # For custom module submits, we'd need the custom_module_answer table
+            # Since we don't have it, we'll note this limitation
+            result['cm_submits'] = 0  # Placeholder
+            
+            return result
+        
+        test_analysis_df = analyze_test_submissions(lesson_test_df)
+        
+        # Display analysis
+        st.subheader("Daily Test Submission Summary")
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            total_qbank = test_analysis_df['qbank_submits'].sum()
+            st.metric("Total QBank Submits", total_qbank)
+        
+        with col2:
+            total_test = test_analysis_df['test_submits'].sum()
+            st.metric("Total Test Submits", total_test)
+        
+        with col3:
+            st.metric("Total Custom Module Submits", "N/A")
+        
+        # Time series of submissions
+        daily_submissions = test_analysis_df.groupby('submit_date').agg({
+            'qbank_submits': 'sum',
+            'test_submits': 'sum'
+        }).reset_index()
+        
+        fig = px.line(daily_submissions, x='submit_date', y=['qbank_submits', 'test_submits'],
+                     title='Daily Submission Trends', labels={'value': 'Count', 'variable': 'Type'})
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Top users by submissions
+        top_users = test_analysis_df.groupby('user_id').agg({
+            'qbank_submits': 'sum',
+            'test_submits': 'sum'
+        }).sum(axis=1).sort_values(ascending=False).head(10)
+        
+        fig2 = px.bar(x=top_users.index, y=top_users.values,
+                     title='Top 10 Users by Total Submissions')
         st.plotly_chart(fig2, use_container_width=True)
+        
+        # Display raw data
+        st.subheader("Raw Test Submission Data")
+        st.dataframe(lesson_test_df.head(100))
+    
+    with tab3:
+        st.header("Video Meta Analysis")
+        
+        # Basic stats
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            unique_lessons = video_meta_df['lesson_id'].nunique()
+            st.metric("Unique Lessons", unique_lessons)
+        
+        with col2:
+            unique_subjects = video_meta_df['_subject_title'].nunique()
+            st.metric("Unique Subjects", unique_subjects)
+        
+        with col3:
+            avg_duration = video_meta_df['_duration'].mean()
+            st.metric("Average Duration (min)", f"{avg_duration/60:.1f}")
+        
+        # Subject distribution
+        subject_dist = video_meta_df['_subject_title'].value_counts().reset_index()
+        subject_dist.columns = ['Subject', 'Count']
+        
+        fig = px.pie(subject_dist, values='Count', names='Subject',
+                    title='Video Distribution by Subject')
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Duration distribution
+        fig2 = px.histogram(video_meta_df, x='_duration',
+                           title='Video Duration Distribution')
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        # Display raw data
+        st.subheader("Raw Video Meta Data")
+        st.dataframe(video_meta_df.head(100))
+    
+    with tab4:
+        st.header("Suspicious Activity Analysis")
+        
+        # Basic stats
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            total_alerts = len(suspicious_activity_df)
+            st.metric("Total Alerts", total_alerts)
+        
+        with col2:
+            unique_users_alerted = suspicious_activity_df['user_id'].nunique()
+            st.metric("Users with Alerts", unique_users_alerted)
+        
+        with col3:
+            high_risk_alerts = len(suspicious_activity_df[suspicious_activity_df['alert_level'] == 'high'])
+            st.metric("High Risk Alerts", high_risk_alerts)
+        
+        # Alert level distribution
+        alert_dist = suspicious_activity_df['alert_level'].value_counts().reset_index()
+        alert_dist.columns = ['Alert Level', 'Count']
+        
+        fig = px.pie(alert_dist, values='Count', names='Alert Level',
+                    title='Alert Level Distribution')
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Category distribution
+        category_dist = suspicious_activity_df['category'].value_counts().reset_index()
+        category_dist.columns = ['Category', 'Count']
+        
+        fig2 = px.bar(category_dist, x='Category', y='Count',
+                     title='Suspicious Activity by Category')
+        st.plotly_chart(fig2, use_container_width=True)
+        
+        # Time series of alerts
+        alerts_over_time = suspicious_activity_df.groupby('date').size().reset_index(name='count')
+        fig3 = px.line(alerts_over_time, x='date', y='count',
+                      title='Suspicious Activity Over Time')
+        st.plotly_chart(fig3, use_container_width=True)
+        
+        # Display raw data
+        st.subheader("Raw Suspicious Activity Data")
+        st.dataframe(suspicious_activity_df.head(100))
 
-# Simple risk radar (example heuristic)
-st.header('Simple risk score & breakdown')
-# create basic user-level risk metrics if a user selected
-if selected_user:
-    ua = license_df[license_df['user_id'].astype(str)==selected_user]
-    if not ua.empty:
-        # metrics
-        total_videos = ua['lesson_id'].dropna().astype(str).nunique()
-        devices = ua['device_id'].nunique()
-        days_active = ua['date_parsed'].nunique()
-        hours_est = ua.get('playback_minutes', pd.Series()).dropna().sum() / 60 if 'playback_minutes' in ua.columns else 0
-        over90 = ua.get('quality', pd.Series()).dropna().shape[0]
-
-        # normalize to 0-1 for radar
-        vals = [min(total_videos/200,1), min(devices/5,1), min(days_active/30,1), min(hours_est/50,1), min(over90/100,1)]
-        labels = ['Videos','Devices','Days active','Hours','Over90']
-        radar = go.Figure()
-        radar.add_trace(go.Scatterpolar(r=vals, theta=labels, fill='toself', name=selected_user))
-        radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0,1])), showlegend=False, title='Risk Radar (sample normalized metrics)')
-        st.plotly_chart(radar, use_container_width=True)
-
-# -------------------------
-# Downloads
-# -------------------------
-st.header('Downloads')
-st.download_button('Download license agg CSV', license_agg.to_csv(index=False).encode('utf-8'), 'license_agg.csv')
-if not ldf.empty:
-    st.download_button('Download qbank/test agg CSV', qb_agg.to_csv(index=False).encode('utf-8'), 'qbank_agg.csv')
-
-st.markdown('---')
-st.caption('This is a starter one-page Streamlit app. You can expand the visuals (timeline per device, geo maps, cohort comparisons, PDF report export) as next steps.')
+else:
+    st.warning("Please upload all four CSV files to begin analysis.")
+    st.info("""
+    Required files:
+    1. Video License Logs CSV
+    2. Lesson Test Submissions CSV
+    3. Video Meta CSV
+    4. Suspicious Activity Logs CSV
+    """)
